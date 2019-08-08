@@ -1,12 +1,11 @@
 var KrakenClient = require('kraken-api'),
-  path = require('path'),
   minimist = require('minimist'),
   moment = require('moment'),
   n = require('numbro'),
+  // eslint-disable-next-line no-unused-vars
   colors = require('colors')
 
-module.exports = function container(get, set, clear) {
-  var c = get('conf')
+module.exports = function container(conf) {
   var s = {
     options: minimist(process.argv)
   }
@@ -14,7 +13,7 @@ module.exports = function container(get, set, clear) {
 
   var public_client, authed_client
   // var recoverableErrors = new RegExp(/(ESOCKETTIMEDOUT|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|API:Invalid nonce|API:Rate limit exceeded|between Cloudflare and the origin web server)/)
-  var recoverableErrors = new RegExp(/(ESOCKETTIMEDOUT|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|API:Invalid nonce|between Cloudflare and the origin web server)/)
+  var recoverableErrors = new RegExp(/(ESOCKETTIMEDOUT|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|API:Invalid nonce|between Cloudflare and the origin web server|The web server reported a gateway time-out|The web server reported a bad gateway|525: SSL handshake failed|Service:Unavailable|api.kraken.com \| 522:)/)
   var silencedRecoverableErrors = new RegExp(/(ESOCKETTIMEDOUT|ETIMEDOUT)/)
 
   function publicClient() {
@@ -26,30 +25,57 @@ module.exports = function container(get, set, clear) {
 
   function authedClient() {
     if (!authed_client) {
-      if (!c.kraken || !c.kraken.key || c.kraken.key === 'YOUR-API-KEY') {
+      if (!conf.kraken || !conf.kraken.key || conf.kraken.key === 'YOUR-API-KEY') {
         throw new Error('please configure your Kraken credentials in conf.js')
       }
-      authed_client = new KrakenClient(c.kraken.key, c.kraken.secret)
+      authed_client = new KrakenClient(conf.kraken.key, conf.kraken.secret)
     }
     return authed_client
   }
 
-  function joinProduct(product_id) {
-    return product_id.split('-')[0] + product_id.split('-')[1]
+  // This is to deal with a silly bug where kraken doesn't use a consistent definition for currency
+  // with certain assets they will mix the use of 'Z' and 'X' prefixes
+  function joinProductFormatted(product_id) {
+    var asset = product_id.split('-')[0]
+    var currency = product_id.split('-')[1]
+
+    var assetsToFix = ['BCH', 'DASH', 'EOS', 'GNO']
+    if (assetsToFix.indexOf(asset) >= 0 && currency.length > 3) {
+      currency = currency.substring(1)
+    }
+    return asset + currency
   }
 
   function retry(method, args, error) {
+    let timeout, errorMsg
     if (error.message.match(/API:Rate limit exceeded/)) {
-      var timeout = 10000
+      timeout = 10000
     } else {
-      var timeout = 150
+      timeout = 150
     }
 
     // silence common timeout errors
     if (so.debug || !error.message.match(silencedRecoverableErrors)) {
       if (error.message.match(/between Cloudflare and the origin web server/)) {
         errorMsg = 'Connection between Cloudflare CDN and api.kraken.com failed'
-      } else {
+      }
+      else if (error.message.match(/The web server reported a gateway time-out/)) {
+        errorMsg = 'Web server Gateway time-out'
+      }
+      else if (error.message.match(/The web server reported a bad gateway/)) {
+        errorMsg = 'Web server bad Gateway'
+      }
+      else if (error.message.match(/525: SSL handshake failed/)) {
+        errorMsg = 'SSL handshake failed'
+      }
+      else if (error.message.match(/Service:Unavailable/)) {
+        errorMsg = 'Service Unavailable'
+      }
+      else if (error.message.match(/api.kraken.com \| 522:/)) {
+        errorMsg = 'Generic 522 Server error'
+      }
+
+      else {
         errorMsg = error
       }
       console.warn(('\nKraken API warning - unable to call ' + method + ' (' + errorMsg + '), retrying in ' + timeout / 1000 + 's').yellow)
@@ -77,7 +103,7 @@ module.exports = function container(get, set, clear) {
       var func_args = [].slice.call(arguments)
       var client = publicClient()
       var args = {
-        pair: joinProduct(opts.product_id)
+        pair: joinProductFormatted(opts.product_id)
       }
       if (opts.from) {
         args.since = Number(opts.from) * 1000000
@@ -155,7 +181,7 @@ module.exports = function container(get, set, clear) {
     getQuote: function(opts, cb) {
       var args = [].slice.call(arguments)
       var client = publicClient()
-      var pair = joinProduct(opts.product_id)
+      var pair = joinProductFormatted(opts.product_id)
       client.api('Ticker', {
         pair: pair
       }, function(error, data) {
@@ -195,7 +221,7 @@ module.exports = function container(get, set, clear) {
           return cb(data.error.join(','))
         }
         if (so.debug) {
-          console.log("cancelOrder")
+          console.log('\nFunction: cancelOrder')
           console.log(data)
         }
         cb(error)
@@ -206,11 +232,11 @@ module.exports = function container(get, set, clear) {
       var args = [].slice.call(arguments)
       var client = authedClient()
       var params = {
-        pair: joinProduct(opts.product_id),
+        pair: joinProductFormatted(opts.product_id),
         type: type,
         ordertype: (opts.order_type === 'taker' ? 'market' : 'limit'),
         volume: opts.size,
-        trading_agreement: c.kraken.tosagree
+        trading_agreement: conf.kraken.tosagree
       }
       if (opts.post_only === true && params.ordertype === 'limit') {
         params.oflags = 'post'
@@ -219,7 +245,7 @@ module.exports = function container(get, set, clear) {
         params.price = opts.price
       }
       if (so.debug) {
-        console.log("trade")
+        console.log('\nFunction: trade')
         console.log(params)
       }
       client.api('AddOrder', params, function(error, data) {
@@ -241,11 +267,11 @@ module.exports = function container(get, set, clear) {
         }
 
         if (so.debug) {
-          console.log("Data")
+          console.log('\nData:')
           console.log(data)
-          console.log("Order")
+          console.log('\nOrder:')
           console.log(order)
-          console.log("Error")
+          console.log('\nError:')
           console.log(error)
         }
 
@@ -303,7 +329,7 @@ module.exports = function container(get, set, clear) {
         }
         var orderData = data.result[params.txid]
         if (so.debug) {
-          console.log("QueryOrders")
+          console.log('\nfunction: QueryOrders')
           console.log(orderData)
         }
 
@@ -323,6 +349,7 @@ module.exports = function container(get, set, clear) {
           order.status = 'done'
           order.done_at = new Date().getTime()
           order.filled_size = n(orderData.vol_exec).format('0.00000000')
+          order.price = n(orderData.price).format('0.00000000')
           return cb(null, order)
         }
 
